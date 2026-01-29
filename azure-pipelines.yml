@@ -1,0 +1,138 @@
+pr: none
+trigger: none
+
+
+pool: Agilence
+
+parameters:
+  - name: TEST_BRANCH
+    displayName: Software Branch to Test - Leave as USE_BASE_BRANCH to use pipeline branch, otherwise set pipeline branch to matching base branch (eg. set pipeline to master for testing hotfix, develop for testing feature, etc.)
+    type: string
+    default: 'USE_BASE_BRANCH' # Parameters can't be optional or blank, so we have to set a default value in order to allow the pipeline to run without needing to set the matching branch every time
+  - name: TEST_SYSTEM
+    displayName: Test System Hostname - The hostname of the test system to deploy to, leave as USE_DEFAULT to use UI-TEST system matching the branch being tested
+    type: string
+    default: 'USE_DEFAULT'
+variables:
+  - group: vcenter-variables-qa
+  - name: AWX_SCRIPT_PATH
+    value:  '\\installers\Artifacts\DevOps\master\Scripts\New-AWXJobFromTemplate.ps1'
+  - ${{ if contains(variables['Build.SourceBranch'], '/bugfix/') }}:
+      # This expression turns /refs/heads/bugfix/2.*.*/branch-name into the matching /refs/heads/release/2.*.* branch
+    - name: BASE_BRANCH
+      value: ${{ replace(replace(replace(variables['Build.SourceBranch'], format('{0}{1}','/', variables['Build.SourceBranchName']), ''), 'bugfix', 'release'), 'refs/heads/', '') }}
+  - ${{ elseif contains(variables['Build.SourceBranch'], '/feature/') }}:
+    - name: BASE_BRANCH
+      value: 'develop'
+  - ${{ elseif contains(variables['Build.SourceBranch'], '/hotfix/') }}:
+    - name: BASE_BRANCH
+      value: 'master'
+  - ${{ else }}:
+    - name: BASE_BRANCH
+      value: ${{ replace(variables['Build.SourceBranch'], 'refs/heads/', '') }}
+  - ${{ if eq(parameters.TEST_BRANCH, 'USE_BASE_BRANCH') }}:
+    - name: SOFTWARE_BRANCH
+      value: ${{ variables.BASE_BRANCH }}
+  - ${{ else }}:
+    - name: SOFTWARE_BRANCH
+      value: ${{ parameters.TEST_BRANCH }}
+  # This is the name of the test system to deploy to and the source DB server. They are chosen based on the branch being tested
+  - ${{ if eq(variables['BASE_BRANCH'], 'master') }}:
+    - name: TEST_SYSTEM_HOSTNAME
+      value: 'UI-TEST-MASTER'
+    - name: RESTORE_SOURCE_DB_SERVER
+      value: 'autosrc-master'
+  - ${{ elseif contains(variables['BASE_BRANCH'], 'release') }}:
+    - name: TEST_SYSTEM_HOSTNAME
+      value: 'UI-TEST-REL'
+    - name: RESTORE_SOURCE_DB_SERVER
+      value: 'autosrc-release'
+  - ${{ elseif eq(variables['BASE_BRANCH'], 'develop') }}:
+    - name: TEST_SYSTEM_HOSTNAME
+      value: 'UI-TEST-DEV'
+    - name: RESTORE_SOURCE_DB_SERVER
+      value: 'autosrc-develop'
+  # Override the test system hostname if a specific one is provided, but keep the source DB server the same
+  - ${{ if ne(parameters.TEST_SYSTEM, 'USE_DEFAULT') }}:
+    - name: TEST_SYSTEM_HOSTNAME
+      value: ${{ parameters.TEST_SYSTEM }}
+
+stages:
+  - stage: Restore
+    jobs:
+        - job: Restore_Backup
+          displayName: "Restore Backup from Source System"
+          variables:
+            EXTRA_VARS: "@{'source_db_server'='$(RESTORE_SOURCE_DB_SERVER)'; 'destination_db_server'='$(TEST_SYSTEM_HOSTNAME)'; 'backup_folder'='E:\\Backups'; 'db_file_folder'='E:\\Databases'; 'db_log_folder'='E:\\Databases'; 'database_names'='\"agFact\", \"agLog\", \"evGlobalConfig\", \"StoreVision\", \"QueryCache\"'}"
+            TEMPLATE_ID: 237
+          steps:
+          - task: PowerShell@2
+            displayName: "Run AWX Restore"
+            inputs:
+              filePath: $(AWX_SCRIPT_PATH)
+              arguments: '-bearerToken "$(AWX_API_TOKEN)" -baseUri "$(AWX_API_BASE)" -ExtraVars $(EXTRA_VARS) -TemplateId $(TEMPLATE_ID) -SCMBranch "$(BASE_BRANCH)" -CredentialID $(CREDENTIAL_ID)'
+              failOnStderr: true
+              pwsh: true
+  - stage: Deploy
+    dependsOn: ['Restore']
+    jobs:
+      - job: Update_Test_System
+        displayName: Update Test System using Latest Bundle
+        variables:
+          EXTRA_VARS: "@{software_branch='$(SOFTWARE_BRANCH)'; vm_name='$(TEST_SYSTEM_HOSTNAME)'; customer_name='Anonymous ADS Retail'; run_windows_updates='false'; software_build= 'latest'; bundle_root_path= '\\\\Installers\\Artifacts\\bundles'; deploy_feature_containers= 'false'}"
+          TEMPLATE_ID: 179
+        steps: 
+        - task: PowerShell@2
+          displayName: "Run AWX Deployment"
+          inputs:
+            filePath: $(AWX_SCRIPT_PATH)
+            arguments: '-bearerToken "$(AWX_API_TOKEN)" -baseUri "$(AWX_API_BASE)" -ExtraVars $(EXTRA_VARS) -TemplateId $(TEMPLATE_ID) -SCMBranch "$(BASE_BRANCH)" -CredentialID $(CREDENTIAL_ID)'
+            failOnStderr: true
+            pwsh: true
+  - stage: Test
+    dependsOn: ['Deploy']
+    jobs:
+      - job: Run_Cucumber_Tests
+        displayName: Run Cucumber Tests
+        timeoutInMinutes: 180
+        variables:
+          JUNIT_REPORTS_FOLDER: ./reports/junit
+          BASE_URL: $(TEST_SYSTEM_HOSTNAME).agilenceqa.com
+        steps:
+        - task: NodeTool@0
+          inputs:
+            versionSource: 'spec'
+            versionSpec: '20.18.1' # The Canvas package requires Node 20.18.1 to run the tests, when that dependency is removed or updated this version can be updated or removed
+        - task: Npm@1
+          displayName: NPM Install
+          inputs:
+            command: install
+          retryCountOnTaskFailure: 5
+        - task: PowerShell@2
+          displayName: Run Cucumber Tests on Test System
+          continueOnError: true
+          inputs:
+            targetType: inline
+            script: |
+              npx wdio wdio.azure.conf.ts server=$(BASE_URL) user=a password=a --suite setup
+              npx wdio wdio.azure.conf.ts server=$(BASE_URL) user=a password=a --suite features
+              npx wdio wdio.azure.conf.ts server=$(BASE_URL) user=a password=a --suite teardown
+        - task: PublishBuildArtifacts@1
+          displayName: Publish Screenshots to Azure
+          inputs:
+            PathtoPublish: '$(Build.SourcesDirectory)/ScreenShots'
+            ArtifactName: 'Screenshots'
+            publishLocation: 'Container'
+        - task: PublishBuildArtifacts@1
+          displayName: Publish Test Reports to Azure
+          inputs:
+            PathtoPublish: '$(Build.SourcesDirectory)/reports/$(BASE_URL)'
+            ArtifactName: 'TestReports'
+            publishLocation: 'Container'
+        - task: PublishTestResults@2
+          displayName: Publish Cucumber Test Results
+          inputs:
+            testResultsFormat: 'JUnit'
+            testResultsFiles: '*.xml'
+            searchFolder: $(JUNIT_REPORTS_FOLDER)
+            failTaskOnFailedTests: true

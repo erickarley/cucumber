@@ -1,0 +1,17 @@
+const { default: clickButton } = require("../Common/clickButton");
+const { default: clickTab } = require("../Common/clickTab");
+
+import pause from "webdriverio/build/commands/browser/pause";
+import checkAvailability from "../../check/Common/checkAvailability";
+import navigateToReportingPage from "../Common/navigateToReportingPage";
+
+export default async () => {
+    await navigateToReportingPage("/Reporting/Landing/Measures");
+    await navigateToReportingPage("/Reporting/Measure");
+    await checkAvailability();
+    pause(3000);
+    await clickTab("FILTERS");
+    pause(3000);
+    await addFilter("Item Count", ">", "10");
+    await clickButton("Followed By");
+}
